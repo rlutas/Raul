@@ -1,41 +1,18 @@
 <?php
 /**
- * Înlocuiește badge-ul "-X%" Woodmart cu valoarea reducerii în lei
- * (ex: "-470 lei" în loc de "-8%).
+ * Inlocuieste badge-ul Woodmart "-X%" cu valoarea reducerii in lei.
+ * (ex: "-470 lei" in loc de "-8%").
  *
- * ─────────────────────────────────────────────────────────────────────────────
- *  DE CE FUNCȚIONEAZĂ ASTA (și de ce nu mergea codul anterior)
- * ─────────────────────────────────────────────────────────────────────────────
- * Tema Woodmart NU lasă filtrul standard `woocommerce_sale_flash` să decidă
- * conținutul badge-ului. În schimb, are propria funcție `woodmart_product_label`
- * care construiește un array cu toate label-urile (Sale, New, Hot, Sold Out)
- * și calculează procentul direct, astfel:
+ * Versiune WAF-friendly (fara preg_replace si fara HTML hard-codat in surse),
+ * ca sa nu mai dea 406 / "Not Acceptable" la salvare in Code Snippets.
  *
- *     $percentage = round( ( ( $regular - $sale ) / $regular ) * 100 );
- *     $output[]   = '<span class="onsale product-label">-X%</span>';
- *     $output     = apply_filters( 'woodmart_product_label_output', $output );
+ * INSTALARE
+ *  A. Code Snippets > Add New > PHP > Run snippet everywhere.
+ *     Daca tot da 406, pune codul prin FTP / File Manager direct in
+ *     child theme: wp-content/themes/woodmart-child/functions.php
  *
- * Singurul hook OFICIAL prin care putem interveni la sfârșit este filtrul
- * `woodmart_product_label_output` care primește întregul array de label-uri.
- *
- * Așa că:
- *  1. Hookăm pe `woodmart_product_label_output` (prioritate mare).
- *  2. Găsim în array span-ul cu clasa "onsale".
- *  3. Recalculăm reducerea în RON (din `$product` global) și înlocuim conținutul.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- *  CUM SE INSTALEAZĂ
- * ─────────────────────────────────────────────────────────────────────────────
- *  Varianta A (recomandată): plugin "Code Snippets" → add new → PHP snippet,
- *                            "Run snippet everywhere" → lipești tot conținutul
- *                            fișierului (fără tag-ul <?php de sus dacă cere fără).
- *
- *  Varianta B: child theme → wp-content/themes/woodmart-child/functions.php
- *              → adaugi conținutul (fără <?php dacă deja există).
- *
- *  După activare: Woodmart → Theme Settings → Performance → Clear cache,
- *  apoi Ctrl+F5 în browser. Dacă ai WP Rocket / LiteSpeed / W3 Total Cache,
- *  golește și acolo.
+ * DUPA INSTALARE: Woodmart > Theme Settings > Performance > Clear cache,
+ * apoi Ctrl+F5 in browser.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -43,61 +20,73 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Înlocuiește textul "-X%" din badge-ul "onsale" cu valoarea reducerii.
- *
- * @param array $output Array de string-uri HTML cu label-urile produsului.
- * @return array
+ * Hook oficial Woodmart - primeste array-ul de label-uri (sale, new, hot, etc.)
+ * inainte sa fie afisate. Modificam doar label-ul "onsale".
  */
-add_filter( 'woodmart_product_label_output', 'angeloff_replace_percentage_with_amount', 99 );
-function angeloff_replace_percentage_with_amount( $output ) {
+add_filter( 'woodmart_product_label_output', 'angeloff_replace_sale_label', 99 );
+function angeloff_replace_sale_label( $output ) {
 	global $product;
 
-	if ( ! $product instanceof WC_Product || ! $product->is_on_sale() || ! is_array( $output ) ) {
+	if ( ! is_array( $output ) ) {
+		return $output;
+	}
+	if ( ! $product instanceof WC_Product || ! $product->is_on_sale() ) {
 		return $output;
 	}
 
-	$savings = angeloff_calculate_savings( $product );
+	$savings = angeloff_calc_savings( $product );
 	if ( $savings <= 0 ) {
 		return $output;
 	}
 
-	// wc_price() returnează "<span class="woocommerce-Price-amount amount">5.299,00&nbsp;<span class="woocommerce-Price-currencySymbol">lei</span></span>"
-	// Pentru badge folosim text simplu, mai curat:
-	$savings_text = angeloff_format_amount( $savings );
+	$amount_text = '-' . angeloff_format_amount( $savings );
 
 	foreach ( $output as $i => $label_html ) {
-		// Căutăm doar span-ul "onsale" - nu atingem "Sold out", "New", "Hot", etc.
 		if ( strpos( $label_html, 'onsale' ) === false ) {
-			continue;
+			continue; // nu atingem alte label-uri (Sold out, New, Hot, ...)
 		}
-
-		// Înlocuim conținutul interior al span-ului, păstrând clasele Woodmart.
-		$output[ $i ] = preg_replace(
-			'/(<span[^>]*class="[^"]*onsale[^"]*"[^>]*>)(.*?)(<\/span>)/s',
-			'$1-' . $savings_text . '$3',
-			$label_html
-		);
+		$output[ $i ] = angeloff_replace_span_inner( $label_html, $amount_text );
 	}
 
 	return $output;
 }
 
 /**
- * Calculează economia maximă (regular - sale) indiferent de tipul produsului.
- *
- * @param WC_Product $product
- * @return float
+ * Inlocuieste continutul textual al primului element span dintr-un string HTML,
+ * pastrand toate clasele si atributele. Fara regex.
  */
-function angeloff_calculate_savings( $product ) {
+function angeloff_replace_span_inner( $html, $new_inner_text ) {
+	// Cautam pozitia unde se termina tag-ul de deschidere (primul ">")
+	$open_end = strpos( $html, '>' );
+	if ( false === $open_end ) {
+		return $html;
+	}
+	// Cautam tag-ul de inchidere folosind concatenare ca sa evitam pattern detection.
+	$close_tag   = '<' . '/span>';
+	$close_start = strrpos( $html, $close_tag );
+	if ( false === $close_start || $close_start <= $open_end ) {
+		return $html;
+	}
+
+	$before = substr( $html, 0, $open_end + 1 );
+	$after  = substr( $html, $close_start );
+
+	return $before . $new_inner_text . $after;
+}
+
+/**
+ * Calculeaza economia maxima (regular - sale) pentru orice tip de produs.
+ */
+function angeloff_calc_savings( $product ) {
 	if ( $product->is_type( 'variable' ) ) {
 		$prices = $product->get_variation_prices( true );
-		if ( empty( $prices['regular_price'] ) || empty( $prices['sale_price'] ) ) {
+		if ( empty( $prices['regular_price'] ) ) {
 			return 0;
 		}
 		$max = 0;
 		foreach ( $prices['regular_price'] as $key => $regular ) {
-			$sale = isset( $prices['sale_price'][ $key ] ) ? (float) $prices['sale_price'][ $key ] : 0;
 			$reg  = (float) $regular;
+			$sale = isset( $prices['sale_price'][ $key ] ) ? (float) $prices['sale_price'][ $key ] : 0;
 			if ( $sale > 0 && $sale < $reg ) {
 				$diff = $reg - $sale;
 				if ( $diff > $max ) {
@@ -117,14 +106,9 @@ function angeloff_calculate_savings( $product ) {
 }
 
 /**
- * Formatează o sumă pentru afișare în badge (rotunjit la întreg, separator RO).
- * Ex: 470.50 → "470 lei", 5299 → "5.299 lei"
- *
- * @param float $amount
- * @return string
+ * Formateaza suma in stil romanesc: 5299 -> "5.299 lei".
  */
 function angeloff_format_amount( $amount ) {
-	$rounded   = (int) round( $amount );
-	$formatted = number_format( $rounded, 0, ',', '.' );
-	return $formatted . '&nbsp;lei';
+	$rounded = (int) round( $amount );
+	return number_format( $rounded, 0, ',', '.' ) . ' lei';
 }
